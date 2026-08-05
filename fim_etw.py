@@ -85,7 +85,7 @@ NOISE_KEYWORDS = [
 
 # Izlenecek klasor. \Device\HarddiskVolumeX\... seklindeki NT yollarinda
 # eslesme yapabilmek icin sadece klasor adini (kucuk harf) kullaniyoruz.
-WATCH_PATH_KEYWORD = "\\filemonitoring\\"
+WATCH_PATH_KEYWORD = "\\testlab\\"
 
 # True ise: sadece AKTIF KULLANICI OTURUMUNDAKI (Session 0 = sistem/servis DEGIL)
 # process'lerin olaylari gosterilir. SYSTEM/servis kaynakli arka plan
@@ -326,6 +326,170 @@ def lookup_file_object(file_object):
     return _file_object_to_path.get(file_object)
 
 # ==============================================================================
+# KATMAN 3.6: RANSOMWARE DAVRANIŞ ANOMALİ TESPİTİ
+# ==============================================================================
+# Mantık: Ransomware'in en belirgin dosya sistemi izi, KISA SÜREDE ÇOK SAYIDA
+# dosyanın AYNI PROCESS tarafından yeniden adlandırılmasıdır (genellikle
+# şüpheli bir uzantıya - .locked, .encrypted vb. - dönüştürme şeklinde).
+# Normal bir kullanıcı saniyede onlarca dosyayı yeniden adlandırmaz; bu yüzden
+# "bir PID'in kısa bir zaman penceresinde kaç dosyayı şüpheli biçimde
+# yeniden adlandırdığı" güçlü bir anomali sinyalidir (bkz. MITRE ATT&CK T1486).
+
+SUSPICIOUS_RENAME_EXTENSIONS = (
+    ".locked", ".encrypted", ".enc", ".crypt", ".locky", ".cerber", ".wannacry"
+)
+
+RENAME_THRESHOLD = 30          # Zaman penceresi icinde bu sayidan fazla supheli rename -> alarm
+TIME_WINDOW = 5.0              # saniye
+ALERT_COOLDOWN_SECONDS = 10.0  # Ayni PID icin ardisik alarm spam'ini onlemek icin
+
+# process_rename_events[pid] = [timestamp1, timestamp2, ...] (sadece son TIME_WINDOW saniyelik pencere tutulur)
+process_rename_events = {}
+process_last_alert = {}
+_anomaly_lock = threading.Lock()
+
+
+def _is_suspicious_rename(file_path):
+    if not file_path:
+        return False
+    lower = file_path.lower()
+    return any(lower.endswith(ext) for ext in SUSPICIOUS_RENAME_EXTENSIONS)
+
+
+def check_ransomware_anomaly(pid, pname, action, file_path):
+    """
+    Her 'YENIDEN ADLANDIRILDI' olayinda cagrilir. Bir PID'in TIME_WINDOW
+    saniye icinde RENAME_THRESHOLD'dan fazla dosyayi supheli bir uzantiya
+    (SUSPICIOUS_RENAME_EXTENSIONS) donusturdugunu tespit ederse konsola
+    kirmizi alarm basar.
+    """
+    if action != "YENIDEN ADLANDIRILDI" or not _is_suspicious_rename(file_path):
+        return
+
+    now = time.time()
+
+    with _anomaly_lock:
+        events = process_rename_events.setdefault(pid, [])
+        events.append(now)
+
+        # Zaman penceresi disina cikan (eski) kayitlari at
+        cutoff = now - TIME_WINDOW
+        while events and events[0] < cutoff:
+            events.pop(0)
+
+        count_in_window = len(events)
+
+        if count_in_window < RENAME_THRESHOLD:
+            return
+
+        last_alert = process_last_alert.get(pid, 0.0)
+        if now - last_alert < ALERT_COOLDOWN_SECONDS:
+            return  # Ayni PID icin kisa surede tekrar alarm basma (spam onleme)
+
+        process_last_alert[pid] = now
+
+    RED = "\033[91m"
+    RESET = "\033[0m"
+    print(
+        f"{RED}[🚨 ALARM - RANSOMWARE ŞÜPHESİ] PID: {pid} ({pname}) "
+        f"son {TIME_WINDOW:.0f} saniyede {count_in_window} dosyayı şüpheli "
+        f"biçimde yeniden adlandırdı! (eşik: {RENAME_THRESHOLD}){RESET}",
+        flush=True
+    )
+
+# ==============================================================================
+# KATMAN 3.7: CANARY (TUZAK) DOSYA TESPİTİ
+# ==============================================================================
+# Mantık: Klasöre, "önemli" görünen ama içeriği önemsiz sahte bir dosya
+# (canary/honeyfile) koyuyoruz. Meşru hiçbir kullanıcı ya da uygulama normal
+# şartlarda bu dosyaya dokunmaz - bu yüzden ona yapılan HERHANGİ BİR dokunuş
+# (esik/sayaç GEREKMEDEN, tek seferde bile) güçlü bir kötü niyet sinyalidir.
+# Gerçek EDR/ransomware koruma ürünlerinde "honeyfile" veya "canary token"
+# adıyla bilinen, yaygın kullanılan bir tekniktir.
+
+# Buraya tuzak olarak kullanacagin dosyanin SADECE adini (yolunu degil) ekle.
+# Ornek: klasore "Muhasebe_2026_Yedek.xlsx" adinda sahte bir dosya koyup
+# asagidaki listeye eklersin.
+CANARY_FILENAMES = {
+    "onemli.xlsx",
+}
+
+# Bu aksiyonlardan biri canary dosyada gorulursen alarm uretilir.
+# Sadece "acma" (OLUSTURULDU/ACILDI, KAPANDI) kasitli goz ardi edildi, cunku
+# klasoru gezinme/onizleme gibi zararsiz islemler de handle acabiliyor;
+# gercek icerik/durum degisikligi cok daha guclu bir sinyaldir.
+CANARY_ALERT_ACTIONS = {
+    "YAZILDI (WRITE)",
+    "YENIDEN ADLANDIRILDI",
+    "SILINDI (SetDelete)",
+    "SETINFO",
+    "DISKE YAZILDI (FLUSH)",
+}
+
+CANARY_ALERT_COOLDOWN_SECONDS = 5.0
+_canary_last_alert = {}
+_canary_lock = threading.Lock()
+
+
+def _canary_filename_of(file_path):
+    if not file_path:
+        return None
+    return os.path.basename(file_path)
+
+
+def ensure_canary_files(directory):
+    """
+    CANARY_FILENAMES listesindeki dosyalar 'directory' icinde yoksa,
+    onemsiz/sahte icerikle otomatik olusturur. Boylece elle tasima/olusturma
+    derdi kalmaz - script her calistiginda tuzak dosyalarin var oldugundan
+    emin olur.
+    """
+    if not CANARY_FILENAMES:
+        return
+    os.makedirs(directory, exist_ok=True)
+    for name in CANARY_FILENAMES:
+        path = os.path.join(directory, name)
+        if not os.path.exists(path):
+            try:
+                with open(path, "w", encoding="utf-8") as f:
+                    f.write("Bu bir CANARY (tuzak) dosyadir. Sahte icerik.\n")
+                print(f"[+] Canary dosyasi olusturuldu: {path}")
+            except OSError as e:
+                print(f"[!] Canary dosyasi olusturulamadi: {path} -> {e}")
+
+
+def check_canary_alert(pid, pname, action, file_path):
+    """
+    Herhangi bir dosya olayinda cagrilir. Olay bir CANARY dosyaya aitse ve
+    aksiyon CANARY_ALERT_ACTIONS icindeyse, esik/sayac olmadan aninda
+    turuncu/kirmizi alarm basar.
+    """
+    if not CANARY_FILENAMES or action not in CANARY_ALERT_ACTIONS:
+        return
+
+    name = _canary_filename_of(file_path)
+    if not name or name not in CANARY_FILENAMES:
+        return
+
+    now = time.time()
+    key = (pid, file_path)
+
+    with _canary_lock:
+        last = _canary_last_alert.get(key, 0.0)
+        if now - last < CANARY_ALERT_COOLDOWN_SECONDS:
+            return
+        _canary_last_alert[key] = now
+
+    RED = "\033[91m"
+    RESET = "\033[0m"
+    pid_display = pid if pid is not None else "N/A (polling)"
+    print(
+        f"{RED}[🚨🐤 CANARY ALARM] PID: {pid_display} ({pname}) TUZAK DOSYAYA DOKUNDU! "
+        f"Aksiyon: {action} -> {file_path}{RESET}",
+        flush=True
+    )
+
+# ==============================================================================
 # KATMAN 4: ETW KERNEL OTURUMU & CONSUMER
 # ==============================================================================
 # ==============================================================================
@@ -336,7 +500,7 @@ def lookup_file_object(file_object):
 # icin, kernel semasina hic bagli olmayan, HER Windows surumunde ayni sekilde
 # calisan basit ve saglam bir yontem: klasoru kisa araliklarla tarayip
 # onceki anlik goruntu (snapshot) ile karsilastirmak.
-WATCH_DIR = r"C:\FileMonitoring"
+WATCH_DIR = r"C:\Users\sude\Desktop\testLab"
 POLL_INTERVAL_SECONDS = 0.5
 
 def _snapshot_dir(path):
@@ -381,6 +545,11 @@ def poll_watch_dir(stop_event):
             if old_size == new_size:
                 time_str = datetime.now().strftime("%H:%M:%S.%f")[:-3]
                 print(f"[{time_str}] [YENIDEN ADLANDIRILDI  ] {old_path} -> {new_path}", flush=True)
+
+                # ETW tarafinda guvenilir olmadigi icin, canary kontrolunu
+                # BURADA (polling, garantili yol) da calistiriyoruz.
+                check_canary_alert(None, "polling", "YENIDEN ADLANDIRILDI", old_path)
+
                 previous = current
                 continue
 
@@ -513,9 +682,13 @@ def event_callback(event_record_ptr):
         # Close: bu FileObject artik gecerli degil, haritadan temizle (adres yeniden kullanilabilir)
         _file_object_to_path.pop(file_object, None)
 
-    if file_path and not is_noise(file_path, pid=pid) and not is_duplicate_event(pid, action, file_path):
-        time_str = datetime.now().strftime("%H:%M:%S.%f")[:-3]
-        print(f"[{time_str}] [{action:<20}] PName: {pname:<16} (PID: {pid:<5}) -> {file_path}", flush=True)
+    if file_path and not is_noise(file_path, pid=pid):
+        check_ransomware_anomaly(pid, pname, action, file_path)
+        check_canary_alert(pid, pname, action, file_path)
+
+        if not is_duplicate_event(pid, action, file_path):
+            time_str = datetime.now().strftime("%H:%M:%S.%f")[:-3]
+            print(f"[{time_str}] [{action:<20}] PName: {pname:<16} (PID: {pid:<5}) -> {file_path}", flush=True)
 
 
 def start_trace_consumer(session_name=SESSION_NAME):
@@ -546,6 +719,8 @@ if __name__ == "__main__":
         sys.exit(1)
 
     etw = ETWKernelSession()
+
+    ensure_canary_files(WATCH_DIR)
 
     if etw.start_session():
         try:
