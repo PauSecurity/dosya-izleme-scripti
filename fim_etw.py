@@ -457,6 +457,42 @@ def ensure_canary_files(directory):
             except OSError as e:
                 print(f"[!] Canary dosyasi olusturulamadi: {path} -> {e}")
 
+# ------------------------------------------------------------------------
+# ETW <-> POLLING CAPRAZ ILISKILENDIRME (PID zenginlestirme)
+# ------------------------------------------------------------------------
+# ETW'nin Create/Open olaylari bu sistemde GUVENILIR sekilde tetikleniyor
+# (Rename/SetDelete olaylari bu Windows surumunde tetiklenmiyor - onceki
+# debug surecinde kanitlandi, bu yuzden polling fallback'i eklemistik).
+# Rename'e HANGI process'in sebep oldugunu dogrudan goremesek de, o dosyaya
+# EN SON HANGI process'in ETW uzerinden dokundugunu (actigini) hatirlayarak
+# yaklasik/olasilikli bir PID atfi yapabiliriz. Dosya adi (basename)
+# bazinda, kisa bir TTL (gecerlilik suresi) ile saklıyoruz.
+LAST_TOUCHER_TTL_SECONDS = 10.0
+_last_toucher_by_filename = {}
+_last_toucher_lock = threading.Lock()
+
+
+def remember_last_toucher(pid, pname, file_path):
+    name = _canary_filename_of(file_path)
+    if not name:
+        return
+    with _last_toucher_lock:
+        _last_toucher_by_filename[name.lower()] = (pid, pname, time.time())
+
+
+def lookup_last_toucher(file_path):
+    name = _canary_filename_of(file_path)
+    if not name:
+        return None
+    with _last_toucher_lock:
+        entry = _last_toucher_by_filename.get(name.lower())
+    if not entry:
+        return None
+    pid, pname, ts = entry
+    if time.time() - ts > LAST_TOUCHER_TTL_SECONDS:
+        return None  # cok eski, artik guvenilir sayilmaz
+    return pid, pname
+
 
 def check_canary_alert(pid, pname, action, file_path):
     """
@@ -471,6 +507,13 @@ def check_canary_alert(pid, pname, action, file_path):
     if not name or name not in CANARY_FILENAMES:
         return
 
+    approx = False
+    if pid is None:
+        looked_up = lookup_last_toucher(file_path)
+        if looked_up:
+            pid, pname = looked_up
+            approx = True
+
     now = time.time()
     key = (pid, file_path)
 
@@ -482,9 +525,10 @@ def check_canary_alert(pid, pname, action, file_path):
 
     RED = "\033[91m"
     RESET = "\033[0m"
-    pid_display = pid if pid is not None else "N/A (polling)"
+    pid_display = pid if pid is not None else "N/A (bilinmiyor)"
+    approx_label = " [YAKLAŞIK - ETW'den son bilinen dokunuş]" if approx else ""
     print(
-        f"{RED}[🚨🐤 CANARY ALARM] PID: {pid_display} ({pname}) TUZAK DOSYAYA DOKUNDU! "
+        f"{RED}[🚨🐤 CANARY ALARM]{approx_label} PID: {pid_display} ({pname}) TUZAK DOSYAYA DOKUNDU! "
         f"Aksiyon: {action} -> {file_path}{RESET}",
         flush=True
     )
@@ -683,6 +727,7 @@ def event_callback(event_record_ptr):
         _file_object_to_path.pop(file_object, None)
 
     if file_path and not is_noise(file_path, pid=pid):
+        remember_last_toucher(pid, pname, file_path)
         check_ransomware_anomaly(pid, pname, action, file_path)
         check_canary_alert(pid, pname, action, file_path)
 
