@@ -30,6 +30,8 @@ import sys
 import os
 import struct
 import time
+import json
+import math
 from datetime import datetime
 import threading
 import psutil
@@ -67,6 +69,210 @@ PROCESS_GUID = make_guid(
 PROCESS_EVENT_TYPE_START = 1  # EVENT_TRACE_TYPE_START
 
 KERNEL_LOGGER_NAME = "NT Kernel Logger"  # SABIT isim, degistirilemez
+
+# ==============================================================================
+# GURULTU AZALTMA - tekrar eden olaylari birlestirme (dedup)
+# ==============================================================================
+# Mantik: VS Code'un arka plan araclari (linter/formatter/dil sunucusu) gibi
+# suracler, ayni dosyaya SANIYEDE BIRKAC KEZ dokunabiliyor - bunlarin HEPSINI
+# tek tek basmak, gercek sinyali gurultuye gomer. Ayni (process, dosya,
+# aksiyon) uclusu kisa bir pencerede (2 sn) tekrar geliyorsa, sadece ilkini
+# gosteriyoruz.
+DEDUPE_WINDOW_SECONDS = 2.0
+_dedupe_cache = {}
+_dedupe_lock = threading.Lock()
+
+
+def is_duplicate_event(pid, action, file_path):
+    key = (pid, action, file_path)
+    now = time.monotonic()
+    with _dedupe_lock:
+        last_seen = _dedupe_cache.get(key)
+        if last_seen is not None and (now - last_seen) < DEDUPE_WINDOW_SECONDS:
+            return True
+        _dedupe_cache[key] = now
+        return False
+
+# ==============================================================================
+# ALARM LOG DOSYASI - otomatik test raporu icin (bkz. test_detection_suite.py)
+# ==============================================================================
+# Her alarm, ekrana basilmasinin YANI SIRA bu dosyaya da (JSON Lines formati,
+# her satir bagimsiz bir JSON nesnesi) kaydedilir. test_detection_suite.py bu
+# dosyayi okuyup, hangi senaryo sirasinda hangi alarmin geldigini zaman
+# damgasina gore eslestirerek OTOMATIK bir PASS/FAIL raporu uretebilir -
+# elle "terminale bak, karsilastir" yapmaya gerek kalmaz.
+ALERT_LOG_PATH = "alerts_log.jsonl"
+_alert_log_lock = threading.Lock()
+
+# ==============================================================================
+# CALISMA MODU - varsayilan SESSIZ (production/arka plan mantigiyla)
+# ==============================================================================
+# QUIET_MODE = True iken: rutin dosya olaylari (OLUSTURULDU/SILINDI/vb.)
+# HICBIR ZAMAN ekrana basilmaz. Sadece GERCEK ALARM durumunda konusur.
+# Bu, bir sistem tepsisi arac gibi arka planda sessizce calisip, sadece
+# gercek bir tehdit oldugunda kullaniciyi uyaran gercekci bir tasarim.
+# Gelistirme/debug icin False yaparsan eski (ayrintili) log geri doner.
+QUIET_MODE = True
+
+INCIDENT_INSTRUCTIONS = [
+    "Bilgisayarınızı HEMEN İnternet/ağ bağlantısından ayırın (Wi-Fi'ı kapatın veya kabloyu çekin) - yayılmayı önler.",
+    "Şüpheli programı KAPATMAYA ÇALIŞMAYIN kendi başınıza - IT/güvenlik ekibinizle iletişime geçin.",
+    "HİÇBİR ŞEKİLDE fidye ÖDEMEYİN - ödeme, dosyalarınızın geri geleceğini garanti etmez.",
+    "Bilgisayarı KAPATMAYIN - açık tutun, adli analiz (forensics) için kanıt kaybolabilir.",
+    "Varsa GÜNCEL YEDEKLERİNİZİ (bulut/harici disk) bu bilgisayara BAĞLAMAYIN.",
+    "Bu olayı IT/güvenlik ekibinize ve gerekiyorsa yetkililere bildirin.",
+]
+
+
+def show_incident_alert(title, pid, pname, detail):
+    """Tum alarm turleri icin ORTAK, kullaniciya yonelik net uyari ekrani.
+    Sadece 'bir sey oldu' demiyor, NE YAPILMASI GEREKTIGINI de soyluyor -
+    gercek bir EDR/uyari sisteminin son kullaniciya gosterdigi seye benzer."""
+    RED = "\033[91m"
+    BOLD = "\033[1m"
+    RESET = "\033[0m"
+    print("\n" + f"{RED}{BOLD}" + "!" * 78 + f"{RESET}", flush=True)
+    print(f"{RED}{BOLD}  SİSTEMİNİZDE RANSOMWARE ŞÜPHESİ TESPİT EDİLDİ{RESET}", flush=True)
+    print(f"{RED}{BOLD}" + "!" * 78 + f"{RESET}", flush=True)
+    print(f"{RED}  Tespit türü : {title}{RESET}", flush=True)
+    print(f"{RED}  Süreç       : {pname} (PID: {pid}){RESET}", flush=True)
+    print(f"{RED}  Detay       : {detail}{RESET}", flush=True)
+    print(f"{RED}  Zaman       : {datetime.now().strftime('%H:%M:%S')}{RESET}", flush=True)
+    print(f"{RED}{BOLD}  YAPMANIZ GEREKENLER:{RESET}", flush=True)
+    for i, step in enumerate(INCIDENT_INSTRUCTIONS, 1):
+        print(f"{RED}    {i}. {step}{RESET}", flush=True)
+    print(f"{RED}{BOLD}" + "!" * 78 + f"{RESET}\n", flush=True)
+
+    popup_message = (
+        f"Tespit türü: {title}\n"
+        f"Süreç: {pname} (PID: {pid})\n"
+        f"Detay: {detail}\n\n"
+        "YAPMANIZ GEREKENLER:\n" +
+        "\n".join(f"{i}. {step}" for i, step in enumerate(INCIDENT_INSTRUCTIONS, 1))
+    )
+    threading.Thread(
+        target=show_windows_popup,
+        args=("⚠️ Ransomware Şüphesi Tespit Edildi", popup_message),
+        daemon=True
+    ).start()
+
+
+def log_alert_to_file(alert_type, pid, pname, message):
+    entry = {
+        "timestamp": time.time(),
+        "time_str": datetime.now().strftime("%H:%M:%S.%f")[:-3],
+        "alert_type": alert_type,
+        "pid": pid,
+        "pname": pname,
+        "message": message,
+    }
+    try:
+        with _alert_log_lock:
+            with open(ALERT_LOG_PATH, "a", encoding="utf-8") as f:
+                f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    except OSError:
+        pass  # loglama basarisiz olsa bile ana tespit akisini bozma
+
+    record_alert_and_check_incident(alert_type, pid, pname, message)
+
+
+# ==============================================================================
+# KESINLESMIS OLAY (CONFIRMED INCIDENT) - coklu kanit birikince kullaniciya sor
+# ==============================================================================
+# Mantik: Tek bir sinyal (ozellikle dusuk-orta guvenli olanlar) yanlis
+# pozitif olabilir - ama AYNI process icin KISA SUREDE FARKLI turden 2+
+# sinyal (ornek: hem davranissal hem entropi hem defense evasion) birikirse,
+# bu tesadufi olma ihtimali cok dusuktur. Bu durumda kullaniciya butun
+# kaniti TEK EKRANDA gosterip aksiyon sorusu soruyoruz - "adam demistim"
+# yaklasimi: tek sinyalde erken alarma gerek yok, ama kanit birikince
+# kullaniciyi bilgilendirilmis bir karara zorluyoruz.
+INCIDENT_WINDOW_SECONDS = 60.0     # bu sure icindeki farkli alarm turleri birlikte degerlendirilir
+INCIDENT_MIN_DISTINCT_TYPES = 2    # en az kac FARKLI alarm turu bir araya gelince "kesinlesmis olay" sayilir
+INCIDENT_COOLDOWN_SECONDS = 120.0  # ayni PID icin tekrar tekrar sorma
+_pid_alert_history = {}
+_pid_incident_prompted = {}
+_incident_lock = threading.Lock()
+
+
+def record_alert_and_check_incident(alert_type, pid, pname, message):
+    now = time.time()
+    with _incident_lock:
+        history = _pid_alert_history.setdefault(pid, [])
+        history.append((alert_type, now, message))
+        cutoff = now - INCIDENT_WINDOW_SECONDS
+        _pid_alert_history[pid] = [h for h in history if h[1] >= cutoff]
+        history = _pid_alert_history[pid]
+
+        distinct_types = sorted(set(h[0] for h in history))
+        if len(distinct_types) < INCIDENT_MIN_DISTINCT_TYPES:
+            return
+        last_prompt = _pid_incident_prompted.get(pid, 0.0)
+        if now - last_prompt < INCIDENT_COOLDOWN_SECONDS:
+            return
+        _pid_incident_prompted[pid] = now
+        evidence = list(history)
+
+    # Kullaniciya soru sormak (input()) ETW callback thread'ini BLOKE
+    # ETMEMELI - ayri bir thread'de calistiriyoruz, ana olay akisi durmuyor.
+    threading.Thread(target=show_confirmed_incident_prompt,
+                      args=(pid, pname, distinct_types, evidence), daemon=True).start()
+
+
+def show_confirmed_incident_prompt(pid, pname, distinct_types, evidence):
+    RED = "\033[91m"
+    BOLD = "\033[1m"
+    RESET = "\033[0m"
+    print("\n" + f"{RED}{BOLD}" + "#" * 78 + f"{RESET}", flush=True)
+    print(f"{RED}{BOLD}  KESİNLEŞMİŞ OLAY ŞÜPHESİ - BİRDEN FAZLA BAĞIMSIZ KANIT BİRİKTİ{RESET}", flush=True)
+    print(f"{RED}{BOLD}" + "#" * 78 + f"{RESET}", flush=True)
+    print(f"{RED}  Süreç: {pname} (PID: {pid})  |  Son {INCIDENT_WINDOW_SECONDS:.0f} saniyede {len(distinct_types)} FARKLI tespit türü:{RESET}", flush=True)
+    for alert_type, ts, msg in evidence:
+        time_str = datetime.fromtimestamp(ts).strftime("%H:%M:%S")
+        print(f"{RED}    [{time_str}] {alert_type}: {msg[:100]}{RESET}", flush=True)
+    print(f"{RED}{BOLD}" + "#" * 78 + f"{RESET}", flush=True)
+
+    popup_message = (
+        f"Süreç: {pname} (PID: {pid})\n"
+        f"Son {INCIDENT_WINDOW_SECONDS:.0f} saniyede {len(distinct_types)} FARKLI tespit türü birikti:\n\n" +
+        "\n".join(f"• {a}" for a in distinct_types) +
+        "\n\nBu, gerçek bir ransomware olayı olabilir.\n\n"
+        "Şüpheli süreci HEMEN DURDURMAK ister misiniz?\n"
+        "(EVET = durdur / HAYIR = izlemeye devam et / İPTAL = bildirimi kapat)"
+    )
+    # ONEMLI: burada input() KULLANMIYORUZ - Windows'ta arka plan thread'inde
+    # input() cagirmak GIL'i duzgun birakmayip TUM diger thread'leri (ETW
+    # olay isleme dahil) donduruyordu (gercek testte kanitlandi - alarmlar
+    # birikip test bitince toptan cikiyordu). MessageBoxW kendi native mesaj
+    # dongusunu kullaniyor, GIL/stdin ile catismiyor, hizli ve engellemesiz.
+    threading.Thread(
+        target=_ask_incident_action_via_popup,
+        args=(pid, pname, popup_message),
+        daemon=True
+    ).start()
+
+
+MB_YESNOCANCEL = 0x03
+IDYES = 6
+IDNO = 7
+
+
+def _ask_incident_action_via_popup(pid, pname, popup_message):
+    RED = "\033[91m"
+    RESET = "\033[0m"
+    try:
+        result = user32.MessageBoxW(
+            None, popup_message, "🚨 KESİNLEŞMİŞ OLAY ŞÜPHESİ",
+            MB_ICONWARNING | MB_TOPMOST | MB_YESNOCANCEL
+        )
+    except Exception:
+        result = None
+
+    if result == IDYES:
+        auto_respond(pid, pname, "kullanıcı onayıyla KESİNLEŞMİŞ OLAY üzerine durduruldu", force=True)
+    elif result == IDNO:
+        print(f"{RED}  [i] İzlemeye devam ediliyor, süreç durdurulmadı.{RESET}", flush=True)
+    else:
+        print(f"{RED}  [i] Bildirim kapatıldı.{RESET}", flush=True)
 
 class EVENT_TRACE_PROPERTIES(ctypes.Structure):
     _fields_ = [
@@ -180,6 +386,38 @@ TRACEHANDLE = ctypes.c_uint64
 # WIN32 DLL IMZALARI & SABITLER
 # ==============================================================================
 advapi32 = ctypes.windll.advapi32
+kernel32 = ctypes.windll.kernel32
+user32 = ctypes.windll.user32
+
+
+def enable_console_colors():
+    """Windows konsolunun ANSI renk kodlarini (←[91m gibi) GERCEK renk olarak
+    yorumlamasini saglar. Bu yapilmazsa bazi eski cmd.exe/PowerShell
+    konfigurasyonlarinda kodlar duz metin olarak (cirkin sekilde) gorunur."""
+    ENABLE_VIRTUAL_TERMINAL_PROCESSING = 0x0004
+    STD_OUTPUT_HANDLE = -11
+    handle = kernel32.GetStdHandle(STD_OUTPUT_HANDLE)
+    mode = wintypes.DWORD()
+    if kernel32.GetConsoleMode(handle, ctypes.byref(mode)):
+        kernel32.SetConsoleMode(handle, mode.value | ENABLE_VIRTUAL_TERMINAL_PROCESSING)
+
+
+# Native Windows pop-up (MessageBoxW) - ekstra kutuphane GEREKTIRMEZ, Windows'un
+# kendi API'si. Gercek bir "sistem uyarisi" hissi verir (Windows Guvenlik
+# Merkezi'nin kullandigi mekanizmalarla ayni aile).
+MB_ICONWARNING = 0x30
+MB_TOPMOST = 0x40000
+MB_SYSTEMMODAL = 0x1000  # diger tum pencerelerin ONUNDE zorla gorunur
+
+
+def show_windows_popup(title, message):
+    """Ayri bir thread'de cagrilmali - MessageBoxW BLOKE EDICI'dir (kullanici
+    'Tamam'a basana kadar bekler), ETW callback thread'ini bloke etmemesi icin."""
+    try:
+        user32.MessageBoxW(None, message, title, MB_ICONWARNING | MB_TOPMOST)
+    except Exception:
+        pass
+
 
 advapi32.StartTraceW.restype = wintypes.ULONG
 advapi32.StartTraceW.argtypes = [ctypes.POINTER(TRACEHANDLE), wintypes.LPCWSTR, ctypes.POINTER(EVENT_TRACE_PROPERTIES)]
@@ -245,6 +483,7 @@ SESSION_NAME = KERNEL_LOGGER_NAME  # Klasik logger icin ISIM SABIT olmali
 # Sadece bu klasordeki olaylari goster (fim_etw.py ile ayni mantik).
 # Bos string birakirsan TUM sistem gosterilir (cok gurultulu).
 WATCH_PATH_KEYWORD = "\\filemonitoring\\"
+WATCH_DIR = r"C:\FileMonitoring"  # entropi olcumu icin gercek yol karsiligi (WATCH_PATH_KEYWORD ile tutarli olmali)
 
 # Isim tasimayan (dosya yolu belirlenemeyen) event'leri gosterme.
 # Sadece opcode'lari kesfetmek icin gecici olarak True yapabilirsin.
@@ -271,12 +510,14 @@ def guid_equal(g1, g2):
 # karmasik) - butun UserData'yi metne cevirip anahtar kelime arıyoruz,
 # ayni dosya yolu regex'i gibi saglam/basit bir yaklasim.
 SUSPICIOUS_COMMAND_KEYWORDS = (
-    "vssadmin", "wmic shadowcopy", "shadowcopy delete", "bcdedit",
-    "wbadmin delete", "recoveryenabled", "diskshadow", "delete shadows",
-    "delete catalog",
+    "vssadmin delete", "vssadmin resize",   # sadece YIKICI alt-komutlar - "list" artik tetiklemiyor
+    "wmic shadowcopy delete", "shadowcopy delete",
+    "bcdedit /set", "bcdedit  set",         # recoveryenabled/bootstatuspolicy degistirme
+    "wbadmin delete", "diskshadow", "delete catalog",
 )
-_evasion_alerted_pids = set()
+_evasion_alerted_pids = {}  # pid -> son alarm zamani (kalici set DEGIL - PID yeniden kullanimi hatasi olustururdu)
 _evasion_lock = threading.Lock()
+EVASION_ALERT_COOLDOWN_SECONDS = 300.0  # ayni PID icin 5 dakikada bir tekrar kontrol edilebilir
 
 
 def check_defense_evasion(pid, pname, decoded_userdata):
@@ -285,10 +526,12 @@ def check_defense_evasion(pid, pname, decoded_userdata):
     if not matched:
         return
 
+    now = time.time()
     with _evasion_lock:
-        if pid in _evasion_alerted_pids:
+        last = _evasion_alerted_pids.get(pid, 0.0)
+        if now - last < EVASION_ALERT_COOLDOWN_SECONDS:
             return
-        _evasion_alerted_pids.add(pid)
+        _evasion_alerted_pids[pid] = now
 
     # Komut satirini okunabilir hale getirmeye calis: null byte'larla ayrilmis
     # parcalar arasinda anahtar kelimeyi iceren parcayi bul.
@@ -300,7 +543,8 @@ def check_defense_evasion(pid, pname, decoded_userdata):
     message = (f"[🚨 DEFENSE EVASION] PID: {pid} ({pname}) YEDEK/KURTARMA SİLME KOMUTU "
                f"TESPİT EDİLDİ: '{command_guess.strip()}' - şifrelemeden ÖNCEKİ hazırlık aşaması olabilir!")
     message = escalate_with_discovery_context(pid, message)
-    print(f"{RED}{message}{RESET}", flush=True)
+    show_incident_alert(escalated_title(pid, "Defense Evasion (Yedek/Kurtarma Silme)"), pid, pname, command_guess.strip())
+    log_alert_to_file("DEFENSE_EVASION", pid, pname, message)
     auto_respond(pid, pname, f"şüpheli komut: {command_guess.strip()}")
 
 
@@ -313,10 +557,38 @@ def check_defense_evasion(pid, pname, decoded_userdata):
 CANARY_FILENAMES = {
     "onemli.xlsx",
 }
-CANARY_ALERT_ACTIONS = {"SILINDI (SetDelete)", "YENIDEN ADLANDIRILDI", "YAZILDI (Write)", "SETINFO"}
+CANARY_ALERT_ACTIONS = {"SILINDI (SetDelete)", "YENIDEN ADLANDIRILDI"}
+# NOT: "YAZILDI (Write)" ve "SETINFO" BILEREK YOK - bu Windows surumunde
+# klasik FileIo semasinda Write/SetInfo event'leri (opcode 68/69) HICBIR
+# ZAMAN dosya adini metin olarak tasimiyor (isimsiz geliyor, bkz.
+# event_callback'teki "if file_path:" filtresi). Bu action'lar
+# CANARY_ALERT_ACTIONS'a eklense bile file_path hep None oldugu icin
+# check_canary_alert asla cagrilmiyor - eskiden burada duran bu iki deger
+# hicbir zaman eslesmeyen, yaniltici "olu kod"du.
 CANARY_ALERT_COOLDOWN_SECONDS = 5.0
 _canary_last_alert = {}
 _canary_lock = threading.Lock()
+
+
+def ensure_canary_files(directory):
+    """
+    CANARY_FILENAMES listesindeki dosyalar 'directory' icinde yoksa,
+    onemsiz/sahte icerikle otomatik olusturur. fim_etw.py'de vardi ama
+    fim_etw_classic.py'ye tasinmamisti - bu, canary'nin production'da
+    (elle mudahale olmadan) hic calismamasina yol aciyordu, duzeltildi.
+    """
+    if not CANARY_FILENAMES:
+        return
+    os.makedirs(directory, exist_ok=True)
+    for name in CANARY_FILENAMES:
+        path = os.path.join(directory, name)
+        if not os.path.exists(path):
+            try:
+                with open(path, "w", encoding="utf-8") as f:
+                    f.write("Bu bir CANARY (tuzak) dosyadir. Sahte icerik.\n")
+                print(f"[+] Canary dosyasi olusturuldu: {path}")
+            except OSError as e:
+                print(f"[!] Canary dosyasi olusturulamadi: {path} -> {e}")
 
 
 def check_canary_alert(pid, pname, action, file_path):
@@ -352,8 +624,13 @@ def check_canary_alert(pid, pname, action, file_path):
     message = (f"[🚨🐤 CANARY ALARM - SAF ETW] PID: {pid} ({pname}, itibar: {reputation}) TUZAK DOSYAYA DOKUNDU! "
                f"Aksiyon: {action} -> {file_path}{parent_note}")
     message = escalate_with_discovery_context(pid, message)
-    print(f"{RED}{message}{RESET}", flush=True)
-    auto_respond(pid, pname, "canary dosyaya dokundu")
+    show_incident_alert(escalated_title(pid, "Tuzak (Canary) Dosyaya Dokunma"), pid, pname, f"{action} -> {file_path}{parent_note}")
+    log_alert_to_file("CANARY", pid, pname, message)
+    # CANARY, sistemdeki EN YUKSEK guvenli sinyal - mesru hicbir surec bu
+    # dosyaya dokunmaz, bu yuzden ONAY BEKLEMEDEN aninda surecistop durduruyoruz.
+    # Amac: dosyayi kurtarmak degil (o zaten olmus bitmis), AYNI surecin
+    # KALAN binlerce dosyaya dokunmasini - yani YAYILMAYI - durdurmak.
+    auto_respond(pid, pname, "canary dosyaya dokundu (en yuksek guven sinyali)", force=True)
 
 
 # ==============================================================================
@@ -408,7 +685,9 @@ def check_ransomware_anomaly(pid, pname, action, file_path):
                f"son {TIME_WINDOW:.0f} saniyede {count} dosyayı şüpheli biçimde yeniden adlandırdı! "
                f"(eşik: {effective_threshold}){parent_note}")
     message = escalate_with_discovery_context(pid, message)
-    print(f"{RED}{message}{RESET}", flush=True)
+    show_incident_alert(escalated_title(pid, "Davranışsal (Toplu Şüpheli Rename)"), pid, pname,
+                         f"{count} dosya {TIME_WINDOW:.0f} saniyede yeniden adlandırıldı{parent_note}")
+    log_alert_to_file("RANSOMWARE_BEHAVIOR", pid, pname, message)
     auto_respond(pid, pname, f"{count} dosyayı {TIME_WINDOW:.0f} saniyede şüpheli rename")
 
 
@@ -583,6 +862,196 @@ def escalate_with_discovery_context(pid, base_message):
     return base_message
 
 
+def escalated_title(pid, title):
+    """show_incident_alert'in basligina da (sadece log dosyasina degil,
+    kullanicinin GORDUGU ekrana/pop-up'a da) YUKSEK GUVEN etiketini ekler -
+    eskiden bu bilgi sadece alerts_log.jsonl'e yaziliyordu, kullanici hic
+    gormuyordu."""
+    burst_time = _discovery_burst_timestamp.get(pid)
+    if burst_time and (time.time() - burst_time) <= DISCOVERY_CORRELATION_WINDOW_SECONDS:
+        return f"🔥 YÜKSEK GÜVEN — {title}"
+    return title
+
+
+# ==============================================================================
+# YETKI YUKSELTME (PRIVILEGE ESCALATION) TESPITI
+# ==============================================================================
+# Mantik: Ransomware sisteme sizdiktan sonra, tam yetkiyle (SYSTEM/Administrator)
+# calisabilmek icin genelde yetki yukseltmeye calisir - bu asamada dosya
+# hareketi COK AZ olabilir (senin de belirttigin gibi), bu yuzden dosya
+# tabanli katmanlarimizin HICBIRI bunu yakalayamaz. Bilinen yetki yukseltme/
+# kesif komutlarini (whoami /priv, net localgroup administrators, runas,
+# yeni servis/scheduled task olusturma - kalicilik icin de kullanilir)
+# ayni Process class komut satiri taramasiyla yakaliyoruz.
+PRIVESC_COMMAND_KEYWORDS = (
+    "whoami /priv", "whoami /all",
+    "net localgroup administrators", "net user administrator",
+    "runas /user:administrator", "runas /savecred",
+    "sc create", "sc.exe create",           # yeni servis olusturma (persistence/privesc)
+    "schtasks /create",                      # zamanlanmis gorev (persistence/privesc)
+    "reg add hklm", "icacls",                # registry/izin manipulasyonu
+)
+_privesc_alerted_pids = {}  # pid -> son alarm zamani (ayni sebeple set() yerine dict/cooldown)
+_privesc_lock = threading.Lock()
+PRIVESC_ALERT_COOLDOWN_SECONDS = 300.0
+
+
+def check_privilege_escalation(pid, pname, decoded_userdata):
+    lowered = decoded_userdata.lower()
+    matched = next((kw for kw in PRIVESC_COMMAND_KEYWORDS if kw in lowered), None)
+    if not matched:
+        return
+
+    now = time.time()
+    with _privesc_lock:
+        last = _privesc_alerted_pids.get(pid, 0.0)
+        if now - last < PRIVESC_ALERT_COOLDOWN_SECONDS:
+            return
+        _privesc_alerted_pids[pid] = now
+
+    fragments = [f for f in decoded_userdata.split('\x00') if f.strip()]
+    command_guess = next((f for f in fragments if matched in f.lower()), matched)
+
+    ORANGE = "\033[93m"
+    RESET = "\033[0m"
+    message = (f"[🔺 YETKİ YÜKSELTME ŞÜPHESİ] PID: {pid} ({pname}) SÜPHELİ KOMUT: "
+               f"'{command_guess.strip()}' - dosya hareketi olmasa bile bu aşama tehlikelidir!")
+    message = escalate_with_discovery_context(pid, message)
+    show_incident_alert(escalated_title(pid, "Yetki Yükseltme Şüphesi"), pid, pname, command_guess.strip())
+    log_alert_to_file("PRIVILEGE_ESCALATION", pid, pname, message)
+    auto_respond(pid, pname, f"yetki yükseltme şüphesi: {command_guess.strip()}")
+
+
+# ==============================================================================
+# ENTROPI TABANLI TESPIT - fim_polling.py'den tasindi, artik SAF ETW akisinda
+# ==============================================================================
+# Mantik: sifrelenmis/rastgele veri, duz metin/ofis belgesi gibi yapilandirilmis
+# veriden cok daha yuksek Shannon entropisine sahiptir. Tetikleme noktasi
+# olarak Create/Rename olaylarini kullaniyoruz (bunlar guvenilir sekilde tam
+# dosya yolu tasiyor) - dosyanin GUNCEL disk icerigini okuyup entropisini
+# hesapliyoruz (Read/Write event'lerinin kendisini degil, o an diskteki
+# veriyi kullaniyoruz - polling'deki mantikla ayni, tetikleyici farkli).
+#
+# "AKILLICA AYIRMA": tek basina yuksek entropi YETMEZ. ZIP/DOCX/JPG/MP4 gibi
+# formatlar TASARIM GEREGI zaten yuksek entropili - bunlari her zaman
+# supheli saymak yanlis pozitif uretir. Sadece (a) format dogal olarak
+# yuksek entropili DEGILSE, YA DA (b) dosya adi supheli bir ransomware
+# uzantisiyla BITIYORSA tam alarm basiyoruz; aksi halde sessiz gozlem.
+ENTROPY_SAMPLE_BYTES = 4096
+ENTROPY_HIGH_THRESHOLD = 7.5
+ENTROPY_JUMP_THRESHOLD = 2.0
+ENTROPY_TRIGGER_ACTIONS = {"OLUSTURULDU (Create)", "OLUSTURULDU (Create/Name)", "YENIDEN ADLANDIRILDI"}
+
+KNOWN_HIGH_ENTROPY_EXTENSIONS = {
+    ".zip", ".docx", ".xlsx", ".pptx", ".jpg", ".jpeg", ".png", ".gif",
+    ".mp3", ".mp4", ".7z", ".rar", ".gz", ".pdf", ".pfx", ".jar", ".apk",
+}
+SUSPICIOUS_EXTENSIONS_FOR_ENTROPY = (
+    ".locked", ".encrypted", ".enc", ".crypt", ".locky", ".wcry", ".wncry",
+)
+
+_entropy_cache = {}
+_entropy_lock = threading.Lock()
+
+
+def shannon_entropy(data):
+    if not data:
+        return 0.0
+    counts = [0] * 256
+    for b in data:
+        counts[b] += 1
+    length = len(data)
+    entropy = 0.0
+    for c in counts:
+        if c == 0:
+            continue
+        p = c / length
+        entropy -= p * math.log2(p)
+    return entropy
+
+
+def read_entropy_from_disk(windows_path):
+    """ETW'nin verdigi \\Device\\HarddiskVolumeX\\... yolunu, Python'un
+    okuyabilecegi bir yola cevirip dosyanin GUNCEL entropisini olcer."""
+    local_path = ntpath_to_local_path(windows_path)
+    if not local_path or not os.path.isfile(local_path):
+        return None
+    try:
+        with open(local_path, "rb") as f:
+            sample = f.read(ENTROPY_SAMPLE_BYTES)
+        return shannon_entropy(sample)
+    except OSError:
+        return None
+
+
+def ntpath_to_local_path(windows_path):
+    """\\Device\\HarddiskVolumeX\\Klasor\\dosya.txt -> C:\\Klasor\\dosya.txt
+    Basit yaklasim: bizim WATCH_DIR zaten C: uzerinde oldugu icin, path
+    icinde WATCH_DIR'in son klasor adini arayip oradan itibaren C: ile
+    birlestiriyoruz. Zaten \\Device\\... formati olmayan (dogrudan C:\\...
+    ile baslayan) yollari oldugu gibi kullaniyoruz."""
+    if windows_path.lower().startswith("c:\\") or windows_path[1:3] == ":\\":
+        return windows_path
+    marker = os.path.basename(WATCH_DIR.rstrip("\\")).lower()
+    lower = windows_path.lower()
+    idx = lower.find("\\" + marker + "\\")
+    if idx == -1:
+        idx = lower.find("\\" + marker)
+        if idx == -1:
+            return None
+    return "C:" + windows_path[idx:]
+
+
+def entropy_alarm_confidence(path):
+    if any(path.lower().endswith(ext) for ext in SUSPICIOUS_EXTENSIONS_FOR_ENTROPY):
+        return "YUKSEK"
+    _, ext = os.path.splitext(path.lower())
+    if ext not in KNOWN_HIGH_ENTROPY_EXTENSIONS:
+        return "YUKSEK"
+    return "GOZLEM"
+
+
+def check_entropy_anomaly(pid, pname, action, file_path):
+    if action not in ENTROPY_TRIGGER_ACTIONS or not file_path:
+        return
+
+    entropy_after = read_entropy_from_disk(file_path)
+    if entropy_after is None:
+        return
+
+    with _entropy_lock:
+        entropy_before = _entropy_cache.get(file_path)
+        _entropy_cache[file_path] = entropy_after
+
+    if entropy_after < ENTROPY_HIGH_THRESHOLD:
+        return
+
+    jump_ok = entropy_before is None or (entropy_after - entropy_before) >= ENTROPY_JUMP_THRESHOLD
+    # Yeni dosyada (entropy_before yok) sadece mutlak esik yeterli; degisen
+    # dosyada hem esik hem sicrama gerekli (polling'deki ayni mantik).
+    if entropy_before is not None and not jump_ok:
+        return
+
+    confidence = entropy_alarm_confidence(file_path)
+    jump_note = f"{entropy_before:.2f} → {entropy_after:.2f}" if entropy_before is not None else f"{entropy_after:.2f} (yeni dosya)"
+
+    if confidence == "GOZLEM":
+        if SHOW_DISCOVERY_OBSERVATIONS:  # ayni "sessiz gozlem" bayragini paylasiyoruz
+            print(f"    [ℹ️ gözlem] PID {pid} ({pname}) {os.path.basename(file_path)} "
+                  f"entropi: {jump_note} bit/byte (bilinen yüksek-entropili format, tek başına alarm değil)", flush=True)
+        return
+
+    RED = "\033[91m"
+    RESET = "\033[0m"
+    message = (f"[🚨 ENTROPİ ALARMI] PID: {pid} ({pname}) {os.path.basename(file_path)} "
+               f"entropi: {jump_note} bit/byte — muhtemel şifreleme!")
+    message = escalate_with_discovery_context(pid, message)
+    show_incident_alert(escalated_title(pid, "Entropi (Muhtemel Şifreleme)"), pid, pname,
+                         f"{os.path.basename(file_path)} — entropi: {jump_note} bit/byte")
+    log_alert_to_file("ENTROPY", pid, pname, message)
+    auto_respond(pid, pname, f"entropi anomalisi: {jump_note}")
+
+
 # ==============================================================================
 # 4) OTOMATIK TEPKI (RESPONSE) - VARSAYILAN KAPALI
 # ==============================================================================
@@ -599,24 +1068,41 @@ AUTO_RESPONSE_ENABLED = False
 AUTO_RESPONSE_DRY_RUN = True  # True: sadece ne yapacagini yazar, gercekten oldurmez
 
 
-def auto_respond(pid, pname, reason):
-    if not AUTO_RESPONSE_ENABLED:
-        return
-
+def auto_respond(pid, pname, reason, force=False):
+    """
+    force=False (varsayilan): sadece AUTO_RESPONSE_ENABLED acıksa calisir -
+    bu, sistemin KENDI KENDINE otomatik tepki vermesi icin.
+    force=True: kullanicinin KESINLESMIS OLAY ekraninda "[1] Durdur" secimi
+    gibi, ACIKCA ONAYLADIGI durumlar icin - AUTO_RESPONSE_ENABLED/DRY_RUN
+    ayarlarindan bagimsiz olarak GERCEKTEN calisir (kullanicinin kendi
+    kararidir, sistemin otomatik kararinin degil).
+    """
     RED = "\033[91m"
     RESET = "\033[0m"
 
-    if AUTO_RESPONSE_DRY_RUN:
-        print(f"{RED}[🛑 OTOMATIK TEPKİ - DRY RUN] PID {pid} ({pname}) DURDURULACAKTI "
-              f"(sebep: {reason}) - gerçekte durdurulmadı, AUTO_RESPONSE_DRY_RUN=True{RESET}", flush=True)
-        return
+    if not force:
+        if not AUTO_RESPONSE_ENABLED:
+            return
+        if AUTO_RESPONSE_DRY_RUN:
+            print(f"{RED}[🛑 OTOMATIK TEPKİ - DRY RUN] PID {pid} ({pname}) DURDURULACAKTI "
+                  f"(sebep: {reason}) - gerçekte durdurulmadı, AUTO_RESPONSE_DRY_RUN=True{RESET}", flush=True)
+            return
 
     try:
         proc = psutil.Process(pid)
         proc.suspend()  # once dondur (kill() yerine suspend() daha az yikici - geri alinabilir)
-        print(f"{RED}[🛑 OTOMATIK TEPKİ] PID {pid} ({pname}) DONDURULDU (sebep: {reason}){RESET}", flush=True)
+        print(f"{RED}[🛑 TEPKİ UYGULANDI] PID {pid} ({pname}) DONDURULDU (sebep: {reason}){RESET}", flush=True)
+        threading.Thread(
+            target=show_windows_popup,
+            args=("🛑 Süreç Durduruldu - Yayılma Engellendi",
+                  f"PID {pid} ({pname}) donduruldu.\nSebep: {reason}\n\n"
+                  "Bu süreç artık YENİ dosyalara dokunamıyor - olası zarar sınırlandı.\n"
+                  "Süreci geri başlatmak (resume) isterseniz Görev Yöneticisi'nden "
+                  "ya da IT ekibinizle birlikte kontrollü şekilde yapın."),
+            daemon=True
+        ).start()
     except (psutil.NoSuchProcess, psutil.AccessDenied) as e:
-        print(f"[!] Otomatik tepki başarısız: {e}", flush=True)
+        print(f"[!] Tepki uygulanamadı: {e}", flush=True)
 
 
 # ==============================================================================
@@ -698,6 +1184,8 @@ def event_callback(event_record_ptr):
                 decoded_latin1 = raw.decode('latin-1', errors='ignore')
                 check_defense_evasion(pid, pname, decoded_utf16)
                 check_defense_evasion(pid, pname, decoded_latin1)
+                check_privilege_escalation(pid, pname, decoded_utf16)
+                check_privilege_escalation(pid, pname, decoded_latin1)
             except Exception:
                 pass
         return
@@ -737,16 +1225,64 @@ def event_callback(event_record_ptr):
 
         check_canary_alert(pid, pname, action, file_path)
         check_ransomware_anomaly(pid, pname, action, file_path)
+        check_entropy_anomaly(pid, pname, action, file_path)
 
-        reputation = process_reputation(pname)
-        rep_tag = f" [{reputation}]" if reputation != "BILINMEYEN" else ""
-        print(f"[{time_str}] [{action:<28}] PName: {pname:<16}{rep_tag} (PID: {pid:<5}) -> {file_path}", flush=True)
+        if not is_duplicate_event(pid, action, file_path) and not QUIET_MODE:
+            reputation = process_reputation(pname)
+            rep_tag = f" [{reputation}]" if reputation != "BILINMEYEN" else ""
+            print(f"[{time_str}] [{action:<28}] PName: {pname:<16}{rep_tag} (PID: {pid:<5}) -> {file_path}", flush=True)
     else:
         if not SHOW_UNNAMED_EVENTS:
             return
         # Isim tasimayan event (Read/Write/SetInfo/Close vb.) - yine de opcode'u
         # gorelim ki bu opcode'un GERCEKTEN tetiklendigini kanitlayabilelim.
         print(f"[{time_str}] [{action:<28}] PName: {pname:<16} (PID: {pid:<5}) -> (isim yok, opcode={opcode})", flush=True)
+
+
+# ==============================================================================
+# PERIYODIK BELLEK TEMIZLIGI - 7/24 arka plan calisma icin
+# ==============================================================================
+# Mantik: Her yeni process, PID bazli sozluklerde (_proc_cache, _rename_events,
+# _direnum_events, _entropy_cache, _pid_alert_history vb.) bir kayit acar.
+# Sistem SUREKLI acilan/kapanan process'lerle 7/24 calisirsa, bu sozlukler
+# hic temizlenmezse zamanla sinirsiz buyur (memory leak). Periyodik olarak,
+# artik CALISMAYAN process'lere ait PID kayitlarini siliyoruz - bu ayrica
+# PID YENIDEN KULLANIMI sorununu da (bkz. defense evasion/privesc cooldown
+# duzeltmesi) dolayli olarak azaltir.
+CACHE_CLEANUP_INTERVAL_SECONDS = 300.0  # 5 dakikada bir
+
+
+def cleanup_stale_pid_caches():
+    pid_keyed_dicts = [
+        _proc_cache, _parent_cache, _rename_events, _last_alert,
+        _direnum_events, _direnum_last_alert, _discovery_burst_timestamp,
+        _evasion_alerted_pids, _privesc_alerted_pids, _pid_alert_history,
+        _pid_incident_prompted,
+    ]
+    removed = 0
+    for d in pid_keyed_dicts:
+        stale_pids = [pid for pid in list(d.keys()) if isinstance(pid, int) and not psutil.pid_exists(pid)]
+        for pid in stale_pids:
+            d.pop(pid, None)
+            removed += 1
+    # _canary_last_alert ve _entropy_cache PID degil (pid,action)/path anahtarli,
+    # basit boyut sinirlamasiyla (en eski kayitlari atarak) buyumesini kisitla.
+    for d, max_size in ((_canary_last_alert, 5000), (_entropy_cache, 5000), (_dedupe_cache, 5000)):
+        if len(d) > max_size:
+            for k in list(d.keys())[: len(d) - max_size]:
+                d.pop(k, None)
+    if removed:
+        print(f"[i] Bellek temizligi: {removed} artik gecerli olmayan PID kaydi silindi.", flush=True)
+
+
+def periodic_cleanup_loop(stop_event):
+    while not stop_event.is_set():
+        stop_event.wait(CACHE_CLEANUP_INTERVAL_SECONDS)
+        if not stop_event.is_set():
+            try:
+                cleanup_stale_pid_caches()
+            except Exception:
+                pass
 
 
 def start_trace_consumer():
@@ -775,6 +1311,21 @@ if __name__ == "__main__":
         print("[!] HATA: Yonetici olarak calistirmalisin!")
         sys.exit(1)
 
+    enable_console_colors()
+
+    # WATCH_DIR yoksa olustur, canary dosyasi(lari) yoksa otomatik olustur -
+    # eskiden fim_etw.py'de vardi, buraya tasinmayi unutmustuk (production'da
+    # canary'nin hic calismamasina yol aciyordu).
+    os.makedirs(WATCH_DIR, exist_ok=True)
+    ensure_canary_files(WATCH_DIR)
+
+    # Her calistirmada temiz bir alarm log dosyasiyla basla (test raporu icin)
+    try:
+        if os.path.exists(ALERT_LOG_PATH):
+            os.remove(ALERT_LOG_PATH)
+    except OSError:
+        pass
+
     session = ClassicKernelSession()
 
     if session.start_session():
@@ -782,14 +1333,23 @@ if __name__ == "__main__":
             consumer_thread = threading.Thread(target=start_trace_consumer, daemon=True)
             consumer_thread.start()
 
+            cleanup_stop_event = threading.Event()
+            cleanup_thread = threading.Thread(target=periodic_cleanup_loop, args=(cleanup_stop_event,), daemon=True)
+            cleanup_thread.start()
+
             print("=" * 90)
-            print("  Klasik NT Kernel Logger ile FileIo izleme + gelişmiş tespit")
-            print("  Katmanlar: Canary | Davranışsal (rename hızı) | Defense Evasion (Shadow Copy)")
-            print("             Process İtibarı | Ebeveyn Zinciri | Discovery (destekleyici sinyal)")
+            print("  Klasik NT Kernel Logger ile FileIo izleme + gelişmiş tespit (TEK SCRIPT)")
+            print("  Katmanlar: Canary | Davranışsal (rename hızı) | Entropi (akıllı false-positive filtresi)")
+            print("             Defense Evasion (Shadow Copy) | Yetki Yükseltme | Discovery (destekleyici sinyal)")
+            print("             Process İtibarı | Ebeveyn Zinciri")
+            print(f"  Çalışma modu: {'SESSİZ (sadece gerçek alarm gösterilir)' if QUIET_MODE else 'AYRINTILI (tüm dosya olayları görünür - debug modu)'}")
+            print(f"  Alarm log: {ALERT_LOG_PATH} (test_detection_suite.py için)")
             print(f"  Otomatik tepki: {'AKTIF' if AUTO_RESPONSE_ENABLED else 'KAPALI'}"
                   f"{' (DRY RUN)' if AUTO_RESPONSE_ENABLED and AUTO_RESPONSE_DRY_RUN else ''}")
             print("  (Çıkış: CTRL+C)")
             print("=" * 90 + "\n")
+            if QUIET_MODE:
+                print("  [i] Sistem arka planda çalışıyor. Şüpheli bir durum olmadıkça hiçbir şey basılmayacak.\n", flush=True)
 
             while consumer_thread.is_alive():
                 time.sleep(0.5)
@@ -797,4 +1357,5 @@ if __name__ == "__main__":
         except KeyboardInterrupt:
             print("\n[-] Kapatiliyor...")
         finally:
+            cleanup_stop_event.set()
             session.stop_session()
